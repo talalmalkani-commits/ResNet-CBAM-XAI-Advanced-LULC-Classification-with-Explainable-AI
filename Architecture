@@ -1,0 +1,24 @@
+
+Input (64x64x3)
+↓
+Stem (Conv3x3→Conv3x3 stride2)
+↓
+Residual Block 1 (64→64)
+↓
+Residual Block 2 (64→64) + CBAM
+↓
+Residual Block 3 (64→128 stride2)
+↓
+Residual Block 4 (128→128) + CBAM
+↓
+Residual Block 5 (128→256 stride2)
+↓
+Residual Block 6 (256→256) + CBAM
+↓
+Global Average Pooling
+↓
+Dropout (0.4)
+↓
+FC (256→128→5)
+↓
+Softmax Output
