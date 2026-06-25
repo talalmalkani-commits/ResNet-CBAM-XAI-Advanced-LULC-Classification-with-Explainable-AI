@@ -1,0 +1,18 @@
+training:
+  epochs: 25
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 1e-4
+  label_smoothing: 0.05
+
+model:
+  img_size: 64
+  num_classes: 5
+  cbam_reduction: 8
+  spatial_kernel: 7
+  dropout: 0.4
+
+data:
+  dataset_path: "/path/to/eurosat"
+  selected_classes: ["AnnualCrop", "Forest", "Highway", "Residential", "River"]
+  split: [0.7, 0.15, 0.15]
