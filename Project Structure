@@ -1,0 +1,12 @@
+├── model/              # Model architecture
+│   ├── resnet_cbam.py  # Main model definition
+│   ├── attention.py    # CBAM modules
+│   └── utils.py        # Helper functions
+├── data/               # Data handling
+│   ├── dataset.py      # Dataset and dataloaders
+│   └── preprocessing.py # Augmentation and transforms
+├── evaluation/         # Metrics and visualization
+├── xai/               # XAI implementations
+├── notebooks/         # Jupyter notebooks for analysis
+├── scripts/           # Utility scripts
+└── docs/              # Documentation
