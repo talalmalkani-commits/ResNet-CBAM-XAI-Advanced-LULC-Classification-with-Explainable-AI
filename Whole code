@@ -1,0 +1,434 @@
+# Usman Shah ============================================================
+# ResNet-CBAM-XAI Network for Land Use and Land Cover (LULC)
+# Classification Using the EuroSAT Dataset
+# ============================================================
+
+# ── IMPORTS ─────────────────────────────────────────────────
+import os
+import copy
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, classification_report, confusion_matrix
+)
+from lime import lime_image
+from skimage.segmentation import mark_boundaries
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── CONFIGURATION ────────────────────────────────────────────
+IMG_SIZE = 64 # EuroSAT native resolution
+BATCH_SIZE = 64
+EPOCHS = 25
+LR = 0.001
+WEIGHT_DECAY = 1e-4
+NUM_CLASSES = 5
+
+# ── CHANGE THIS PATH to your Kaggle dataset ─────────────────
+DATASET_PATH = "/kaggle/input/datasets/talalsaeed0000/eurosat5classes/5 classes"
+# Classes used: AnnualCrop, Forest, Highway, Residential, River
+SELECTED_CLASSES = ["AnnualCrop", "Forest", "Highway", "Residential", "River"]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+# ── DATA PREPROCESSING ───────────────────────────────────────
+# Training augmentation
+train_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+    transforms.RandomGrayscale(p=0.05),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.3444, 0.3803, 0.4078], # EuroSAT-specific stats
+                         std=[0.2032, 0.1365, 0.1148])
+])
+
+# Validation / Test (no augmentation)
+eval_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.3444, 0.3803, 0.4078],
+                         std=[0.2032, 0.1365, 0.1148])
+])
+
+# ── LOAD & FILTER DATASET ───────────────────────────────────
+full_dataset = datasets.ImageFolder(DATASET_PATH, transform=train_transform)
+
+# Keep only selected 5 classes
+class_to_idx = {c: i for i, c in enumerate(full_dataset.classes)}
+selected_idxs = [class_to_idx[c] for c in SELECTED_CLASSES]
+
+filtered_indices = [i for i, (_, label) in enumerate(full_dataset.samples) if label in selected_idxs]
+filtered_labels = [full_dataset.targets[i] for i in filtered_indices]
+
+# Remap labels 0-4
+label_map = {old: new for new, old in enumerate(selected_idxs)}
+remapped_labels = [label_map[l] for l in filtered_labels]
+
+print(f"Total filtered samples: {len(filtered_indices)}")
+for c, idx in zip(SELECTED_CLASSES, selected_idxs):
+    count = filtered_labels.count(idx)
+    print(f" {c}: {count}")
+
+# ── STRATIFIED SPLIT 70/15/15 ──────────────────────────────
+sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.30, random_state=42)
+train_rel, temp_rel = next(sss1.split(filtered_indices, remapped_labels))
+
+temp_indices = [filtered_indices[i] for i in temp_rel]
+temp_labels = [remapped_labels[i] for i in temp_rel]
+
+sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.50, random_state=42)
+val_rel, test_rel = next(sss2.split(temp_indices, temp_labels))
+
+train_dataset = Subset(full_dataset, [filtered_indices[i] for i in train_rel])
+val_dataset = Subset(full_dataset, [temp_indices[i] for i in val_rel])
+test_dataset = Subset(full_dataset, [temp_indices[i] for i in test_rel])
+
+# Apply eval transform to val and test
+val_dataset.dataset = copy.deepcopy(full_dataset)
+test_dataset.dataset = copy.deepcopy(full_dataset)
+val_dataset.dataset.transform = eval_transform
+test_dataset.dataset.transform = eval_transform
+
+print(f"\nSplit sizes → Train: {len(train_dataset)} Val: {len(val_dataset)} Test: {len(test_dataset)}")
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+
+# ── CBAM ATTENTION MODULE ───────────────────────────────────
+class ChannelAttention(nn.Module):
+    """Squeeze-and-Excitation style channel attention."""
+    def __init__(self, in_channels, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction, in_channels, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        scale = self.sigmoid(avg_out + max_out).unsqueeze(2).unsqueeze(3)
+        return x * scale
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention using avg+max pooling across channels."""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        attn_map = self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
+        return x * attn_map, attn_map
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module (channel → spatial)."""
+    def __init__(self, in_channels, reduction=8, spatial_kernel=7):
+        super().__init__()
+        self.channel = ChannelAttention(in_channels, reduction)
+        self.spatial = SpatialAttention(spatial_kernel)
+
+    def forward(self, x):
+        x = self.channel(x)
+        x, attn_map = self.spatial(x)
+        return x, attn_map
+
+
+# ── RESIDUAL BLOCK WITH CBAM ────────────────────────────────
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, use_cbam=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.cbam = CBAM(out_channels) if use_cbam else None
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        last_attn = None
+        if self.cbam:
+            out, last_attn = self.cbam(out)
+            
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out, last_attn
+
+
+# ── RESNET-CBAM MODEL ────────────────────────────────────────
+class ResNetCBAM(nn.Module):
+    def __init__(self, num_classes=5):
+        super().__init__()
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        # Residual stages
+        self.stage1_1 = ResidualBlock(64, 64, stride=1, use_cbam=True)
+        self.stage1_2 = ResidualBlock(64, 64, stride=1, use_cbam=True)
+        
+        self.stage2_1 = ResidualBlock(64, 128, stride=2, use_cbam=True)
+        self.stage2_2 = ResidualBlock(128, 128, stride=1, use_cbam=True)
+        
+        self.stage3_1 = ResidualBlock(128, 256, stride=2, use_cbam=True)
+        self.stage3_2 = ResidualBlock(256, 256, stride=1, use_cbam=True)
+        
+        # Classifier head
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.4)
+        self.fc1 = nn.Linear(256, 128)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        
+        x, _ = self.stage1_1(x)
+        x, _ = self.stage1_2(x)
+        
+        x, _ = self.stage2_1(x)
+        x, _ = self.stage2_2(x)
+        
+        x, _ = self.stage3_1(x)
+        # Capture spatial attention mask from the ultimate residual block layer for XAI visualization
+        x, final_attn_map = self.stage3_2(x)
+        
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        
+        if not self.training:
+            return x, final_attn_map
+        return x
+
+
+# ── COUNT PARAMETERS ────────────────────────────────────────
+model = ResNetCBAM(num_classes=NUM_CLASSES).to(device)
+# Temporary override structural flag to get summary sizes safely
+model.train()
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\nModel: ResNet-CBAM")
+print(f"Total trainable parameters: {total_params:,}")
+
+# ── LOSS, OPTIMIZER, SCHEDULER ──────────────────────────────
+criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+
+# ── TRAINING LOOP ────────────────────────────────────────────
+train_losses, val_losses = [], []
+train_accs, val_accs = [], []
+best_val_acc = 0
+best_weights = copy.deepcopy(model.state_dict())
+
+for epoch in range(EPOCHS):
+    # ---- TRAIN ----
+    model.train()
+    running_loss, correct, total = 0, 0, 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        labels = torch.tensor([label_map.get(l.item(), l.item()) for l in labels]).to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        running_loss += loss.item()
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+    train_loss = running_loss / len(train_loader)
+    train_acc = correct / total
+
+    # ---- VALIDATE ----
+    model.eval()
+    v_loss, v_correct, v_total = 0, 0, 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            labels = torch.tensor([label_map.get(l.item(), l.item()) for l in labels]).to(device)
+            
+            outputs, _ = model(images)
+            loss = criterion(outputs, labels)
+            
+            v_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
+            v_correct += (preds == labels).sum().item()
+            v_total += labels.size(0)
+
+    val_loss = v_loss / len(val_loader)
+    val_acc = v_correct / v_total
+    scheduler.step()
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accs.append(train_acc)
+    val_accs.append(val_acc)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_weights = copy.deepcopy(model.state_dict())
+
+    print(f"Epoch [{epoch+1:02d}/{EPOCHS}] "
+          f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+          f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+
+model.load_state_dict(best_weights)
+print(f"\nBest Validation Accuracy: {best_val_acc:.4f}")
+
+# ── TEST EVALUATION ─────────────────────────────────────────
+model.eval()
+y_true, y_pred = [], []
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device)
+        labels = torch.tensor([label_map.get(l.item(), l.item()) for l in labels])
+        outputs, _ = model(images)
+        preds = torch.argmax(outputs, dim=1).cpu()
+        y_true.extend(labels.numpy())
+        y_pred.extend(preds.numpy())
+
+acc = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, average="weighted")
+rec = recall_score(y_true, y_pred, average="weighted")
+f1 = f1_score(y_true, y_pred, average="weighted")
+
+print(f"\n{'='*50}")
+print(f" Test Accuracy  : {acc:.4f}")
+print(f" Test Precision : {prec:.4f}")
+print(f" Test Recall    : {rec:.4f}")
+print(f" Test F1-Score  : {f1:.4f}")
+print(f"{'='*50}")
+print("\nClassification Report:\n")
+print(classification_report(y_true, y_pred, target_names=SELECTED_CLASSES))
+
+# ── CONFUSION MATRIX & CURVES ───────────────────────────────
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=SELECTED_CLASSES, yticklabels=SELECTED_CLASSES)
+plt.title("Confusion Matrix — ResNet-CBAM", fontsize=14)
+plt.xlabel("Predicted Class"); plt.ylabel("True Class")
+plt.tight_layout(); plt.savefig("confusion_matrix.png", dpi=150); plt.show()
+
+# ── LIME EXPLAINABILITY PREDICT FUNCTION ────────────────────
+def predict_fn(images_np):
+    mean = np.array([0.3444, 0.3803, 0.4078])
+    std = np.array([0.2032, 0.1365, 0.1148])
+    tensors = []
+    for img in images_np:
+        img_norm = (img / 255.0 - mean) / std
+        tensors.append(torch.tensor(img_norm.transpose(2, 0, 1), dtype=torch.float32))
+    batch = torch.stack(tensors).to(device)
+    model.eval()
+    with torch.no_grad():
+        logits, _ = model(batch)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+    return probs
+
+# ── STRATEGIC MODEL-INTRINSIC & AGNOSTIC XAI VISUALIZATION ──
+# Collect one stable test example per target class
+shown = {c: False for c in range(NUM_CLASSES)}
+sample_images, sample_labels = [], []
+for images, labels in test_loader:
+    for img, lbl in zip(images, labels):
+        mapped = label_map.get(lbl.item(), lbl.item())
+        if not shown[mapped]:
+            sample_images.append(img)
+            sample_labels.append(mapped)
+            shown[mapped] = True
+    if all(shown.values()):
+        break
+
+# Setup 3-row grid plot output (Original, CBAM Spatial Attention Map, LIME Perturbations)
+explainer = lime_image.LimeImageExplainer()
+fig, axes = plt.subplots(3, 5, figsize=(18, 10))
+
+for i, (img_tensor, true_label) in enumerate(zip(sample_images, sample_labels)):
+    mean = torch.tensor([0.3444, 0.3803, 0.4078]).view(3, 1, 1)
+    std = torch.tensor([0.2032, 0.1365, 0.1148]).view(3, 1, 1)
+    img_display = (img_tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+    img_uint8 = (img_display * 255).astype(np.uint8)
+
+    # Row 1: Original Sample
+    axes[0, i].imshow(img_display)
+    axes[0, i].set_title(f"Class: {SELECTED_CLASSES[true_label]}\n[Original]", fontsize=10, fontweight='bold')
+    axes[0, i].axis("off")
+
+    # Row 2: Intrinsic XAI (CBAM Layer 3 Spatial Attention Map Weights)
+    model.eval()
+    with torch.no_grad():
+        _, attn_map = model(img_tensor.unsqueeze(0).to(device))
+        # Upsample low-res feature map back to matching input visual proportions
+        attn_map_resized = F.interpolate(attn_map, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
+        attn_map_np = attn_map_resized.squeeze().cpu().numpy()
+
+    axes[1, i].imshow(img_display)
+    axes[1, i].imshow(attn_map_np, cmap='jet', alpha=0.45) # Overlay heatmap seamlessly
+    axes[1, i].set_title("CBAM Attention Map", fontsize=9)
+    axes[1, i].axis("off")
+
+    # Row 3: Agnostic XAI (LIME Segmented Explanations)
+    explanation = explainer.explain_instance(img_uint8, predict_fn, top_labels=1, hide_color=0, num_samples=300)
+    temp, mask = explanation.get_image_and_mask(true_label, positive_only=True, num_features=5, hide_rest=False)
+    axes[2, i].imshow(mark_boundaries(temp / 255.0, mask))
+    axes[2, i].set_title("LIME Superpixels", fontsize=9)
+    axes[2, i].axis("off")
+
+plt.suptitle("Multi-Modal XAI Diagnostics Framework\n(Top Row: Input | Middle Row: Core CBAM Focus | Bottom Row: LIME Boundaries)", fontsize=14, y=0.98, fontweight='bold')
+plt.tight_layout()
+plt.savefig("multimodal_xai_framework.png", dpi=175, bbox_inches='tight')
+plt.show()
+
+print("Dual Model-Intrinsic and Agnostic XAI Visualizations generated successfully.")
+
+# ── SAVE MODEL ──────────────────────────────────────────────
+torch.save(model.state_dict(), "ResNetCBAM_LULC.pth")
+print("Model saved as ResNetCBAM_LULC.pth")
